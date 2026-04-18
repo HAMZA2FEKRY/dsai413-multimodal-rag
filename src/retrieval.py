@@ -104,13 +104,15 @@ class Retriever:
         from colpali_engine.models import ColPali, ColPaliProcessor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype  = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        # Use float16 even on CPU to halve memory (~1.5GB instead of ~3GB)
+        dtype  = torch.bfloat16 if torch.cuda.is_available() else torch.float16
 
         logger.info(f"Loading ColPali retrieval model: {colpali_model} on {device}")
         self._model = ColPali.from_pretrained(
             colpali_model,
             torch_dtype=dtype,
             device_map=device,
+            low_cpu_mem_usage=True,
         ).eval()
         self._processor = ColPaliProcessor.from_pretrained(colpali_model)
         self._device = next(self._model.parameters()).device
