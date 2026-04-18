@@ -1,0 +1,38 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables (contains API keys!)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Poppler binary (too large for git, install separately)
+poppler/
+
+# Data files (optional — remove if you want to include sample PDFs)
+# data/pdfs/*.pdf
+
+# Evaluation results (regenerated)
+# data/eval_results.json
+
+# Misc
+*.egg-info/
+dist/
+build/
+*.log

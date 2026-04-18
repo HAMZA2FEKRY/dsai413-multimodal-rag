@@ -1,0 +1,276 @@
+"""
+src/generation.py
+=================
+Generation & QA Pipeline
+-------------------------
+Takes a user query + retrieved pages (images + text snippets) and sends them
+to a Vision-Language Model (Gemini 1.5 Flash by default, GPT-4o as fallback)
+to produce a grounded, citation-backed answer.
+
+The system prompt strictly instructs the model to:
+  - Answer ONLY from the provided document context.
+  - Include citations in the format: [Source: DocName, Page X]
+  - Reply "I don't have enough information..." when the context is insufficient.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import os
+from enum import Enum
+from typing import Any
+
+from loguru import logger
+from PIL import Image
+
+from src.retrieval import RetrievedPage
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM backend selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LLMBackend(str, Enum):
+    """Supported LLM backends for answer generation."""
+    GEMINI = "gemini"
+    OPENAI = "openai"
+
+
+SYSTEM_PROMPT = """You are a precise document Q&A assistant.
+
+RULES (non-negotiable):
+1. Answer ONLY using the document pages provided to you in this conversation.
+2. If the answer cannot be found in the provided pages, respond with:
+   "I don't have enough information in the provided document context to answer this question."
+3. Every factual claim in your answer MUST be followed by a citation in the exact format:
+   [Source: <document_name>, Page <page_number>]
+4. Do NOT speculate, hallucinate, or use external knowledge.
+5. When a table or chart is relevant, describe what you observe in it and cite the page.
+6. Keep your answers concise and well-structured.
+"""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pil_to_bytes(img: Image.Image, fmt: str = "JPEG") -> bytes:
+    """Convert a PIL image to raw bytes (JPEG format)."""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _pil_to_b64(img: Image.Image, fmt: str = "JPEG") -> str:
+    """Encode a PIL image to a base-64 string."""
+    return base64.b64encode(_pil_to_bytes(img, fmt)).decode("utf-8")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generator base
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BaseGenerator:
+    """Abstract base class for answer generators."""
+
+    def generate(
+        self,
+        query: str,
+        retrieved_pages: list[RetrievedPage],
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Generate an answer from query + retrieved context pages."""
+        raise NotImplementedError
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini 1.5 Flash generator
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GeminiGenerator(BaseGenerator):
+    """
+    Uses Google Gemini 1.5 Flash (or Pro) for multi-modal answer generation.
+
+    Set GEMINI_API_KEY in your environment (or .env file).
+    Images are sent as genai.protos.Blob with mime_type image/jpeg.
+    """
+
+    def __init__(self, model_name: str = "gemini-1.5-flash") -> None:
+        """Initialise the Gemini generator with API key from environment."""
+        import google.generativeai as genai
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "GEMINI_API_KEY environment variable is not set. "
+                "Get one free at https://aistudio.google.com/app/apikey"
+            )
+
+        genai.configure(api_key=api_key)
+        self._genai = genai
+        self.model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=SYSTEM_PROMPT,
+        )
+        logger.info(f"Gemini generator ready: {model_name}")
+
+    def generate(
+        self,
+        query: str,
+        retrieved_pages: list[RetrievedPage],
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """
+        Build a multimodal prompt with page images (as Blob) and text excerpts,
+        then call Gemini to generate a grounded answer.
+        """
+        # Build the multimodal user message parts
+        parts: list[Any] = []
+
+        # 1. Attach each retrieved page image + annotation
+        for page in retrieved_pages:
+            parts.append(
+                f"\n--- Document Context: {page.citation} "
+                f"(relevance score: {page.score:.2f}) ---\n"
+            )
+
+            # Send image as genai.protos.Blob (spec requirement)
+            if page.page_image is not None:
+                img_bytes = _pil_to_bytes(page.page_image)
+                parts.append(
+                    self._genai.protos.Part(
+                        inline_data=self._genai.protos.Blob(
+                            mime_type="image/jpeg",
+                            data=img_bytes,
+                        )
+                    )
+                )
+
+            if page.text_excerpt:
+                parts.append(f"[Text excerpt]: {page.text_excerpt}\n")
+
+        # 2. Append the user question
+        parts.append(f"\nUser Question: {query}")
+
+        # 3. Call the model
+        try:
+            response = self.model.generate_content(parts)
+            answer = response.text.strip()
+        except Exception as exc:
+            logger.error(f"Gemini API error: {exc}")
+            answer = "An error occurred while generating the answer. Please try again."
+
+        return answer
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GPT-4o generator (fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class OpenAIGenerator(BaseGenerator):
+    """
+    Uses OpenAI GPT-4o for multi-modal answer generation.
+
+    Set OPENAI_API_KEY in your environment.
+    Images are sent as base64 data URLs in the chat completions API.
+    """
+
+    def __init__(self, model_name: str = "gpt-4o") -> None:
+        """Initialise the OpenAI generator with API key from environment."""
+        from openai import OpenAI
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "OPENAI_API_KEY environment variable is not set."
+            )
+
+        self.client     = OpenAI(api_key=api_key)
+        self.model_name = model_name
+        logger.info(f"OpenAI generator ready: {model_name}")
+
+    def generate(
+        self,
+        query: str,
+        retrieved_pages: list[RetrievedPage],
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """
+        Build a vision chat completion request with page images and text,
+        then call GPT-4o to generate a grounded answer.
+        """
+        # Build messages
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+
+        # Inject prior conversation turns (if any)
+        for turn in (chat_history or []):
+            messages.append(turn)
+
+        # Build user content (text + images)
+        user_content: list[dict[str, Any]] = []
+
+        for page in retrieved_pages:
+            user_content.append({
+                "type": "text",
+                "text": (
+                    f"\n--- Document Context: {page.citation} "
+                    f"(score: {page.score:.2f}) ---\n"
+                    + (f"[Text excerpt]: {page.text_excerpt}" if page.text_excerpt else "")
+                ),
+            })
+            if page.page_image is not None:
+                img_b64 = _pil_to_b64(page.page_image)
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                })
+
+        user_content.append({"type": "text", "text": f"\nUser Question: {query}"})
+        messages.append({"role": "user", "content": user_content})
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,     # type: ignore[arg-type]
+                max_tokens=1024,
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content or ""
+        except Exception as exc:
+            logger.error(f"OpenAI API error: {exc}")
+            answer = "An error occurred while generating the answer. Please try again."
+
+        return answer.strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Factory
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_generator(backend: str = "gemini", **kwargs: Any) -> BaseGenerator:
+    """
+    Factory function to select the LLM backend.
+
+    The backend can be set via:
+      1. LLM_BACKEND environment variable (highest priority)
+      2. ``backend`` argument
+
+    Parameters
+    ----------
+    backend : "gemini" (default) | "openai"
+
+    Returns
+    -------
+    An initialised BaseGenerator subclass.
+    """
+    backend = (os.environ.get("LLM_BACKEND") or backend).lower()
+
+    if backend == LLMBackend.GEMINI:
+        return GeminiGenerator(**kwargs)
+    elif backend == LLMBackend.OPENAI:
+        return OpenAIGenerator(**kwargs)
+    else:
+        raise ValueError(f"Unknown LLM backend: '{backend}'. Choose 'gemini' or 'openai'.")

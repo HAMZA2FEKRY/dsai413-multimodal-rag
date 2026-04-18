@@ -1,0 +1,36 @@
+# ── Core ColPali & Vision-Language ──────────────────────────────────────────
+colpali-engine>=0.3.1               # ColPali model + processor
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.40.0
+Pillow>=10.3.0
+
+# ── PDF Processing ──────────────────────────────────────────────────────────
+pdf2image>=1.17.0                   # converts PDF pages → PIL Images
+pdfplumber>=0.11.0                  # table & structured text extraction
+# NOTE: pdf2image requires poppler installed on your system:
+#   Windows → conda install -c conda-forge poppler  OR download from https://github.com/oschwartz10612/poppler-windows
+#   Linux   → sudo apt-get install poppler-utils
+#   macOS   → brew install poppler
+
+# ── Vector Database ─────────────────────────────────────────────────────────
+qdrant-client>=1.9.0                # Qdrant vector store (local or cloud)
+
+# ── Generation LLM ──────────────────────────────────────────────────────────
+google-generativeai>=0.7.0          # Gemini 1.5 Flash / Pro (primary VLM)
+openai>=1.30.0                      # GPT-4o (optional fallback)
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+gradio>=4.30.0                      # Colab/demo alternative UI
+
+# ── Evaluation ──────────────────────────────────────────────────────────────
+rouge-score>=0.1.2                  # ROUGE for faithfulness
+sentence-transformers>=3.0.0        # semantic similarity scoring
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+kagglehub>=0.2.9                    # dataset download
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+numpy>=1.26.0
+loguru>=0.7.2
