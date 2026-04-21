@@ -85,20 +85,21 @@ class BaseGenerator:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gemini 1.5 Flash generator
+# Gemini generator (google.genai SDK)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class GeminiGenerator(BaseGenerator):
     """
-    Uses Google Gemini 1.5 Flash (or Pro) for multi-modal answer generation.
+    Uses Google Gemini 2.0 Flash for multi-modal answer generation.
 
     Set GEMINI_API_KEY in your environment (or .env file).
-    Images are sent as genai.protos.Blob with mime_type image/jpeg.
+    Images are sent as inline Part objects with mime_type image/jpeg.
     """
 
-    def __init__(self, model_name: str = "gemini-1.5-flash") -> None:
+    def __init__(self, model_name: str = "gemini-2.0-flash") -> None:
         """Initialise the Gemini generator with API key from environment."""
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
 
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
@@ -107,12 +108,9 @@ class GeminiGenerator(BaseGenerator):
                 "Get one free at https://aistudio.google.com/app/apikey"
             )
 
-        genai.configure(api_key=api_key)
-        self._genai = genai
-        self.model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        self._client = genai.Client(api_key=api_key)
+        self._types = types
+        self.model_name = model_name
         logger.info(f"Gemini generator ready: {model_name}")
 
     def generate(
@@ -122,7 +120,7 @@ class GeminiGenerator(BaseGenerator):
         chat_history: list[dict[str, str]] | None = None,
     ) -> str:
         """
-        Build a multimodal prompt with page images (as Blob) and text excerpts,
+        Build a multimodal prompt with page images and text excerpts,
         then call Gemini to generate a grounded answer.
         """
         # Build the multimodal user message parts
@@ -131,31 +129,41 @@ class GeminiGenerator(BaseGenerator):
         # 1. Attach each retrieved page image + annotation
         for page in retrieved_pages:
             parts.append(
-                f"\n--- Document Context: {page.citation} "
-                f"(relevance score: {page.score:.2f}) ---\n"
+                self._types.Part.from_text(
+                    f"\n--- Document Context: {page.citation} "
+                    f"(relevance score: {page.score:.2f}) ---\n"
+                )
             )
 
-            # Send image as genai.protos.Blob (spec requirement)
+            # Send image as inline data
             if page.page_image is not None:
                 img_bytes = _pil_to_bytes(page.page_image)
                 parts.append(
-                    self._genai.protos.Part(
-                        inline_data=self._genai.protos.Blob(
-                            mime_type="image/jpeg",
-                            data=img_bytes,
-                        )
+                    self._types.Part.from_bytes(
+                        data=img_bytes,
+                        mime_type="image/jpeg",
                     )
                 )
 
             if page.text_excerpt:
-                parts.append(f"[Text excerpt]: {page.text_excerpt}\n")
+                parts.append(
+                    self._types.Part.from_text(f"[Text excerpt]: {page.text_excerpt}\n")
+                )
 
         # 2. Append the user question
-        parts.append(f"\nUser Question: {query}")
+        parts.append(self._types.Part.from_text(f"\nUser Question: {query}"))
 
         # 3. Call the model
         try:
-            response = self.model.generate_content(parts)
+            response = self._client.models.generate_content(
+                model=self.model_name,
+                contents=[self._types.Content(role="user", parts=parts)],
+                config=self._types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.2,
+                    max_output_tokens=1024,
+                ),
+            )
             answer = response.text.strip()
         except Exception as exc:
             logger.error(f"Gemini API error: {exc}")
