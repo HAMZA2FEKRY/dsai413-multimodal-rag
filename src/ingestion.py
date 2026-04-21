@@ -276,18 +276,9 @@ class CLIPIngester:
         self._model, self._processor = _load_clip_model(clip_model)
         self._device = next(self._model.parameters()).device
 
-        # Connect to Qdrant — fall back to in-memory if server is unreachable
-        logger.info(f"Connecting to Qdrant @ {qdrant_host}:{qdrant_port}")
-        try:
-            self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5)
-            self.qdrant.get_collections()  # test liveness
-            logger.info("Connected to remote Qdrant.")
-        except Exception as exc:
-            logger.warning(
-                f"Remote Qdrant unavailable ({exc}). "
-                "Falling back to in-memory mode (data will not persist across restarts)."
-            )
-            self.qdrant = QdrantClient(":memory:")
+        # Connect to Qdrant (shared singleton — important for in-memory mode)
+        from src import get_qdrant_client
+        self.qdrant = get_qdrant_client()
 
         self._ensure_collection()
 

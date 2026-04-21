@@ -110,14 +110,9 @@ class Retriever:
         self._processor = CLIPProcessor.from_pretrained(clip_model)
         self._device = next(self._model.parameters()).device
 
-        # Connect to Qdrant — fall back to in-memory if server unreachable
-        logger.info(f"Connecting to Qdrant @ {qdrant_host}:{qdrant_port}")
-        try:
-            self._qdrant = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5)
-            self._qdrant.get_collections()  # test liveness
-        except Exception as exc:
-            logger.warning(f"Remote Qdrant unavailable ({exc}), using in-memory mode.")
-            self._qdrant = QdrantClient(":memory:")
+        # Connect to Qdrant (shared singleton — important for in-memory mode)
+        from src import get_qdrant_client
+        self._qdrant = get_qdrant_client()
 
     # ── Query encoding ────────────────────────────────────────────────────────
 
