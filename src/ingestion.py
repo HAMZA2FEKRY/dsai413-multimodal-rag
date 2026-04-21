@@ -49,7 +49,7 @@ QDRANT_HOST   = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT   = int(os.getenv("QDRANT_PORT", "6333"))
 EMBEDDING_DIM = 512                     # CLIP ViT-B/32 output dimension
 COLLECTION_PREFIX = "clip_"
-MAX_TEXT_CHARS = 500                     # pdfplumber text snippet length
+MAX_TEXT_CHARS = 4000                    # pdfplumber text snippet length (larger for text-only LLMs)
 THUMB_MAX_SIZE = (800, 1000)             # max thumbnail dimensions
 
 # Auto-detect bundled poppler on Windows (for pdf2image)
