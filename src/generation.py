@@ -166,8 +166,16 @@ class GeminiGenerator(BaseGenerator):
             )
             answer = response.text.strip()
         except Exception as exc:
-            logger.error(f"Gemini API error: {exc}")
-            answer = "An error occurred while generating the answer. Please try again."
+            exc_str = str(exc)
+            logger.error(f"Gemini API error: {exc_str}")
+            if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower():
+                answer = (
+                    "⚠️ **Gemini API rate limit reached.** Your free-tier daily quota is exhausted.\n\n"
+                    "**Fix:** Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey), "
+                    "create a **new API key**, and update your `.env` file."
+                )
+            else:
+                answer = f"An error occurred while generating the answer: {exc_str}"
 
         return answer
 
