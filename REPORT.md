@@ -40,9 +40,9 @@ User Query ──► CLIP get_text_features() ──► Qdrant Search ◄──�
                               │
                               ▼ Top-K RetrievedPages
                      ┌──────────────────┐
-                     │  Gemini 1.5 Flash │  system_instruction=strict_prompt
-                     │  (genai.protos    │  images as Blob(mime_type=image/jpeg)
-                     │   .Blob)          │
+                     │  Groq Cloud API   │  Llama 3.3 70B (free)
+                     │  (text excerpts + │  Gemini 2.0 Flash (fallback)
+                     │   system prompt)  │  GPT-4o (fallback)
                      └────────┬─────────┘
                               │
                               ▼
@@ -55,7 +55,7 @@ User Query ──► CLIP get_text_features() ──► Qdrant Search ◄──�
 |-----------|------|---------|
 | **Ingestion** | `src/ingestion.py` | PDF → page images → CLIP image embeddings → Qdrant |
 | **Retrieval** | `src/retrieval.py` | Query text encoding → cosine search → `RetrievedPage` objects |
-| **Generation** | `src/generation.py` | Multimodal prompt → Gemini/GPT-4o → cited answer |
+| **Generation** | `src/generation.py` | Text context prompt → Groq Llama 3.3 / Gemini / GPT-4o → cited answer |
 | **Evaluation** | `src/evaluate.py` | 6 benchmarks, 4 metrics, 3 modalities |
 | **UI** | `app.py` | Streamlit chat with PDF upload, thumbnails, citations |
 
@@ -104,7 +104,7 @@ We use **page-level chunking** where one retrieval unit = one full PDF page:
 - **Preserves structure.** Tables, charts, and multi-column layouts remain intact — no risk of splitting a table across chunks.
 - **Visual context.** CLIP sees the full spatial layout, headers, footers, and figure captions in context.
 - **Simple metadata.** Every result maps cleanly to `[doc_name, page_num]` for citations.
-- **pdfplumber text supplement.** First 500 characters of extracted text are stored alongside the visual embedding as a hybrid search signal.
+- **pdfplumber text supplement.** First 4000 characters of extracted text are stored alongside the visual embedding, providing rich context for text-only LLMs like Groq.
 - **Thumbnails.** Pages are resized to max 800×1000 and stored as base64 in Qdrant payload for instant UI display.
 
 ## 5. Evaluation Results
