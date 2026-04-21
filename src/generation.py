@@ -35,6 +35,7 @@ class LLMBackend(str, Enum):
     """Supported LLM backends for answer generation."""
     GEMINI = "gemini"
     OPENAI = "openai"
+    GROQ   = "groq"
 
 
 SYSTEM_PROMPT = """You are a precise document Q&A assistant.
@@ -263,10 +264,88 @@ class OpenAIGenerator(BaseGenerator):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Groq generator (free, fast, Llama 3.3 70B)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GroqGenerator(BaseGenerator):
+    """
+    Uses Groq Cloud API with Llama 3.3 70B for answer generation.
+
+    Groq is free with generous limits (30 req/min, 6000 tokens/min).
+    Since Groq is text-only, we use the text excerpts from retrieved pages.
+    Set GROQ_API_KEY in your environment (or .env file).
+    Get a free key at: https://console.groq.com/keys
+    """
+
+    def __init__(self, model_name: str = "llama-3.3-70b-versatile") -> None:
+        """Initialise the Groq generator with API key from environment."""
+        from groq import Groq
+
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "GROQ_API_KEY environment variable is not set. "
+                "Get a free key at https://console.groq.com/keys"
+            )
+
+        self.client = Groq(api_key=api_key)
+        self.model_name = model_name
+        logger.info(f"Groq generator ready: {model_name}")
+
+    def generate(
+        self,
+        query: str,
+        retrieved_pages: list[RetrievedPage],
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """
+        Build a text prompt from retrieved page excerpts and call Groq.
+        Groq uses an OpenAI-compatible API (chat completions).
+        """
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+
+        # Inject prior conversation turns
+        for turn in (chat_history or []):
+            messages.append(turn)
+
+        # Build context from retrieved pages (text-only for Groq)
+        context_parts: list[str] = []
+        for page in retrieved_pages:
+            part = (
+                f"\n--- Document Context: {page.citation} "
+                f"(relevance score: {page.score:.2f}) ---\n"
+            )
+            if page.text_excerpt:
+                part += f"{page.text_excerpt}\n"
+            else:
+                part += "[This page contains visual content such as charts, tables, or images]\n"
+            context_parts.append(part)
+
+        user_message = "".join(context_parts) + f"\nUser Question: {query}"
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                max_tokens=1024,
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content or ""
+        except Exception as exc:
+            logger.error(f"Groq API error: {exc}")
+            answer = f"An error occurred while generating the answer: {exc}"
+
+        return answer.strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Factory
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_generator(backend: str = "gemini", **kwargs: Any) -> BaseGenerator:
+def get_generator(backend: str = "groq", **kwargs: Any) -> BaseGenerator:
     """
     Factory function to select the LLM backend.
 
@@ -276,7 +355,7 @@ def get_generator(backend: str = "gemini", **kwargs: Any) -> BaseGenerator:
 
     Parameters
     ----------
-    backend : "gemini" (default) | "openai"
+    backend : "groq" (default) | "gemini" | "openai"
 
     Returns
     -------
@@ -284,9 +363,11 @@ def get_generator(backend: str = "gemini", **kwargs: Any) -> BaseGenerator:
     """
     backend = (os.environ.get("LLM_BACKEND") or backend).lower()
 
-    if backend == LLMBackend.GEMINI:
+    if backend == LLMBackend.GROQ:
+        return GroqGenerator(**kwargs)
+    elif backend == LLMBackend.GEMINI:
         return GeminiGenerator(**kwargs)
     elif backend == LLMBackend.OPENAI:
         return OpenAIGenerator(**kwargs)
     else:
-        raise ValueError(f"Unknown LLM backend: '{backend}'. Choose 'gemini' or 'openai'.")
+        raise ValueError(f"Unknown LLM backend: '{backend}'. Choose 'groq', 'gemini', or 'openai'.")

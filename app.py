@@ -193,7 +193,7 @@ with st.sidebar:
 
     index_name = st.text_input("Index name", value="rag_index",
                                help="Name of the Qdrant collection to query")
-    llm_backend = st.selectbox("LLM Backend", ["gemini", "openai"], index=0,
+    llm_backend = st.selectbox("LLM Backend", ["groq", "gemini", "openai"], index=0,
                                help="Choose the LLM for answer generation")
     top_k = st.slider("Pages retrieved (top-K)", min_value=1, max_value=10, value=5,
                       help="Number of document pages to retrieve for each query")
