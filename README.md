@@ -9,9 +9,9 @@
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-Modal Ingestion** | Converts PDFs to page images, embeds with ColPali, stores in Qdrant |
+| **Multi-Modal Ingestion** | Converts PDFs to page images, embeds with CLIP, stores in Qdrant |
 | **Smart Chunking** | Page-level units preserve table structure, chart layout, and figure context |
-| **Vision-Language Retrieval** | ColPali processes pages as images — no OCR pipeline needed |
+| **Vision-Language Retrieval** | CLIP processes pages as images — no OCR pipeline needed |
 | **Grounded Generation** | Gemini 1.5 Flash / GPT-4o generates answers with mandatory citations |
 | **Interactive Chat UI** | Streamlit app with PDF upload, dark theme, page thumbnails |
 | **Evaluation Suite** | Hit Rate, MRR, ROUGE-L, Semantic Similarity across text/table/image modalities |
@@ -29,7 +29,7 @@
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Retrieval Pipeline                            │
-│      ColPaliProcessor.process_queries() → Qdrant cosine search  │
+│      CLIP get_text_features() → Qdrant cosine search         │
 └────────────────────────┬────────────────────────────────────────┘
                          │ Top-K RetrievedPages
                          ▼
@@ -60,7 +60,7 @@ multimodal_rag/
 │   └── eval_results.json    # Evaluation output
 └── src/
     ├── __init__.py          # Auto-loads .env
-    ├── ingestion.py         # PDF → ColPali embeddings → Qdrant
+    ├── ingestion.py         # PDF → CLIP embeddings → Qdrant
     ├── retrieval.py         # Query encoding → Qdrant search → RetrievedPages
     ├── generation.py        # Multimodal prompt → Gemini/GPT-4o → cited answer
     └── evaluate.py          # Benchmark suite (6 queries, 4 metrics, 3 modalities)
@@ -152,9 +152,9 @@ The evaluation suite benchmarks the RAG pipeline across **3 modalities** (text, 
 
 | Component | Technology |
 |-----------|-----------|
-| Retrieval Model | ColPali (vidore/colpali-v1.2) |
-| Vector Database | Qdrant (cosine distance, 128-dim) |
-| Embedding | ColPaliProcessor (mean-pooled patch embeddings) |
+| Retrieval Model | CLIP ViT-B/32 (openai/clip-vit-base-patch32) |
+| Vector Database | Qdrant (cosine distance, 512-dim) |
+| Embedding | CLIPModel (image + text encoders, 512-dim) |
 | Generation LLM | Gemini 1.5 Flash (primary) / GPT-4o (fallback) |
 | PDF Processing | pdf2image (150 DPI) + pdfplumber (text extraction) |
 | UI Framework | Streamlit (local) |

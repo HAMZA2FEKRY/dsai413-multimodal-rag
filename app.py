@@ -4,7 +4,7 @@ app.py
 Multi-Modal RAG — Streamlit Chat Interface
 ------------------------------------------
 Features:
-  • PDF upload & on-the-fly ColPali ingestion
+  • PDF upload & on-the-fly CLIP ingestion
   • Chat interface with streaming-style display
   • Retrieved page thumbnails shown alongside each answer
   • Citation badges on every answer
@@ -34,7 +34,7 @@ st.set_page_config(
 )
 
 # ── Lazy imports (avoid slow load on startup) ─────────────────────────────────
-@st.cache_resource(show_spinner="Loading ColPali retrieval model…")
+@st.cache_resource(show_spinner="Loading CLIP retrieval model…")
 def load_retriever(index_name: str):
     """Cache the Retriever instance to avoid reloading on every interaction."""
     from src.retrieval import Retriever
@@ -208,11 +208,11 @@ with st.sidebar:
     )
 
     if uploaded_files and st.button("⚡ Ingest PDFs", use_container_width=True):
-        from src.ingestion import ColPaliIngester
+        from src.ingestion import CLIPIngester
 
-        with st.spinner("Running ColPali indexing…"):
+        with st.spinner("Running CLIP indexing…"):
             try:
-                ingester = ColPaliIngester(
+                ingester = CLIPIngester(
                     index_name=index_name,
                     store_page_images=True,
                 )
@@ -225,8 +225,22 @@ with st.sidebar:
                     tmp_path.unlink(missing_ok=True)
 
                 st.success(f"✓ Indexed {len(uploaded_files)} PDF(s)!")
-            except Exception as exc:
-                st.error(f"Ingestion failed: {exc}")
+            except (MemoryError, Exception) as exc:
+                exc_str = str(exc)
+                if "MemoryError" in type(exc).__name__ or "allocate" in exc_str.lower():
+                    st.error(
+                        "❌ **Out of RAM** — not enough free memory to load the model.\n\n"
+                        "**Fix:** Close other applications and try again, "
+                        "or run on Google Colab (see `colab_demo.ipynb`)."
+                    )
+                elif "1455" in exc_str or "paging file" in exc_str.lower():
+                    st.error(
+                        "❌ **Windows paging file too small.**\n\n"
+                        "**Fix**: Control Panel → System → Advanced → Performance Settings → "
+                        "Advanced → Change Virtual Memory → set to ≥ 16 GB."
+                    )
+                else:
+                    st.error(f"Ingestion failed: {exc}")
 
     if st.session_state.ingested_docs:
         st.markdown("**Indexed documents:**")

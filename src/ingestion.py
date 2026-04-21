@@ -1,11 +1,15 @@
 """
 src/ingestion.py
 ================
-Multi-Modal PDF Ingestion & ColPali Indexing Pipeline
-------------------------------------------------------
-Converts every PDF page to a PIL image, embeds it using ColPali's processor
-(mean-pooled 128-dim vectors), and stores them in a Qdrant collection with
+Multi-Modal PDF Ingestion & CLIP Indexing Pipeline
+---------------------------------------------------
+Converts every PDF page to a PIL image, embeds it using OpenAI CLIP
+(512-dim vectors), and stores them in a Qdrant collection with
 rich metadata (doc_name, page_num, text_excerpt, page_image_b64 thumbnail).
+
+CLIP (Contrastive Language–Image Pre-training) embeds both images and text
+into the same vector space, enabling cross-modal retrieval.
+Model size: ~340 MB (vs ColPali's ~6 GB), fits comfortably in 4 GB RAM.
 
 Usage (CLI):
     python -m src.ingestion --pdf_dir data/pdfs --index_name rag_index
@@ -18,6 +22,7 @@ import base64
 import io
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +44,11 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants / defaults
 # ──────────────────────────────────────────────────────────────────────────────
-COLPALI_MODEL = "vidore/colpali-v1.2"
+CLIP_MODEL    = "openai/clip-vit-base-patch32"   # ~340 MB, fits in 4 GB RAM
 QDRANT_HOST   = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT   = int(os.getenv("QDRANT_PORT", "6333"))
-COLPALI_DIM   = 128                     # ColPali mean-pooled vector dimension
-COLLECTION_PREFIX = "colpali_"
+EMBEDDING_DIM = 512                     # CLIP ViT-B/32 output dimension
+COLLECTION_PREFIX = "clip_"
 MAX_TEXT_CHARS = 500                     # pdfplumber text snippet length
 THUMB_MAX_SIZE = (800, 1000)             # max thumbnail dimensions
 
@@ -51,6 +56,122 @@ THUMB_MAX_SIZE = (800, 1000)             # max thumbnail dimensions
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _POPPLER_BIN  = _PROJECT_ROOT / "poppler" / "poppler-24.08.0" / "Library" / "bin"
 POPPLER_PATH  = str(_POPPLER_BIN) if _POPPLER_BIN.exists() else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Windows safetensors mmap workaround
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _apply_windows_safetensors_patch() -> None:
+    """
+    On Windows with a small paging file, safetensors uses memory-mapped I/O
+    which raises OSError 1455 (paging file too small).
+
+    Strategy: monkey-patch `safetensors.safe_open` with a pure-Python
+    seeking reader (_SeekingSafeOpen) that:
+      1. Reads only the JSON header (~KB) into RAM.
+      2. For each `get_tensor()` call, seeks to the exact byte offset of that
+         tensor's data and reads just those bytes — no mmap, no full-file read.
+         Peak extra RAM ≈ size of the largest single tensor (~50–200 MB).
+    """
+    if sys.platform != "win32":
+        return
+
+    try:
+        import json
+        import struct
+
+        import numpy as np
+        import safetensors
+        import torch
+
+        # Safetensors dtype string → (numpy dtype, torch dtype)
+        _DTYPE_MAP: dict = {
+            "F64":  (np.float64,  torch.float64),
+            "F32":  (np.float32,  torch.float32),
+            "F16":  (np.float16,  torch.float16),
+            "BF16": (None,        torch.bfloat16),   # numpy has no bf16
+            "I64":  (np.int64,    torch.int64),
+            "I32":  (np.int32,    torch.int32),
+            "I16":  (np.int16,    torch.int16),
+            "I8":   (np.int8,     torch.int8),
+            "U8":   (np.uint8,    torch.uint8),
+            "BOOL": (np.bool_,    torch.bool),
+        }
+
+        class _SeekingSafeOpen:
+            """
+            Reads individual tensors via file seek — avoids both mmap and
+            loading the entire shard into RAM.
+            """
+
+            def __init__(self, path: str, framework: str, device: str = "cpu"):
+                self._fh = open(path, "rb")
+                # Parse 8-byte little-endian header length prefix
+                header_len = struct.unpack("<Q", self._fh.read(8))[0]
+                raw_header = self._fh.read(header_len)
+                self._header: dict = json.loads(raw_header.decode("utf-8"))
+                self._data_start = 8 + header_len
+                self._tensor_keys = [k for k in self._header if k != "__metadata__"]
+                logger.debug(
+                    f"[win-patch] Opened {path} via seeking reader "
+                    f"({len(self._tensor_keys)} tensors, no mmap)"
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self._fh.close()
+
+            def keys(self):
+                return self._tensor_keys
+
+            def metadata(self) -> dict:
+                """Return safetensors metadata block (transformers checks format='pt')."""
+                return self._header.get("__metadata__", {"format": "pt"})
+
+            def get_tensor(self, key: str):
+                meta = self._header[key]
+                dtype_str: str = meta["dtype"]
+                shape: list = meta["shape"]
+                start, end = meta["data_offsets"]
+                num_bytes = end - start
+
+                self._fh.seek(self._data_start + start)
+                raw = self._fh.read(num_bytes)
+
+                if dtype_str == "BF16":
+                    # numpy has no bfloat16 — load as uint16 and reinterpret
+                    arr = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+                    return torch.from_numpy(arr.copy()).view(torch.bfloat16)
+
+                np_dtype, torch_dtype = _DTYPE_MAP[dtype_str]
+                arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+                return torch.from_numpy(arr.copy()).to(torch_dtype)
+
+        safetensors.safe_open = _SeekingSafeOpen  # type: ignore[assignment]
+
+        # Also patch safetensors.torch.load_file — transformers calls this
+        # directly after the metadata check (modeling_utils.py line 511).
+        import safetensors.torch as st
+
+        def _seeking_load_file(filename: str, device: str = "cpu") -> dict:
+            """Load a safetensors file one tensor at a time without mmap."""
+            result: dict = {}
+            with _SeekingSafeOpen(filename, framework="pt", device=device) as f:
+                for key in f.keys():
+                    result[key] = f.get_tensor(key)
+            return result
+
+        st.load_file = _seeking_load_file  # type: ignore[assignment]
+        logger.info("Applied Windows safetensors seeking (non-mmap) patch.")
+    except Exception as exc:
+        logger.warning(f"Could not apply safetensors Windows patch: {exc}")
+
+
+# Apply once at module import time on Windows
+_apply_windows_safetensors_patch()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,32 +198,40 @@ def _extract_page_text(pdf_path: Path, page_num: int) -> str:
         return ""
 
 
-def _load_colpali_model(model_name: str = COLPALI_MODEL) -> tuple:
+def _load_clip_model(model_name: str = CLIP_MODEL) -> tuple:
     """
-    Load the ColPali model and processor from colpali_engine.
+    Load the CLIP model and processor from HuggingFace transformers.
+
+    CLIP ViT-B/32 is only ~340 MB and fits comfortably in 4 GB RAM.
+    It embeds both images and text into the same 512-dim vector space.
 
     Returns
     -------
     (model, processor) tuple ready for embedding.
     """
-    from colpali_engine.models import ColPali, ColPaliProcessor
+    from transformers import CLIPModel, CLIPProcessor
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use float16 even on CPU to halve memory (~1.5GB instead of ~3GB)
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
 
-    logger.info(f"Loading ColPali model: {model_name} on {device} ({dtype})")
+    # Try local cache first (avoids httpx version conflicts with HF Hub)
+    _local_cache = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{model_name.replace('/', '--')}"
+    if _local_cache.exists():
+        snapshots = _local_cache / "snapshots"
+        local_dirs = sorted(snapshots.iterdir()) if snapshots.exists() else []
+        if local_dirs:
+            model_path = str(local_dirs[-1])
+            logger.info(f"Loading CLIP model from local cache: {model_path}")
+        else:
+            model_path = model_name
+            logger.info(f"Loading CLIP model: {model_name} on {device}")
+    else:
+        model_path = model_name
+        logger.info(f"Loading CLIP model: {model_name} on {device}")
 
-    model = ColPali.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-        low_cpu_mem_usage=True,
-    ).eval()
+    model = CLIPModel.from_pretrained(model_path).to(device).eval()
+    processor = CLIPProcessor.from_pretrained(model_path)
 
-    processor = ColPaliProcessor.from_pretrained(model_name)
-
-    logger.success(f"ColPali model loaded successfully on {device}.")
+    logger.success(f"CLIP model loaded successfully on {device} (~340 MB RAM).")
     return model, processor
 
 
@@ -110,11 +239,11 @@ def _load_colpali_model(model_name: str = COLPALI_MODEL) -> tuple:
 # Core Ingestion Class
 # ──────────────────────────────────────────────────────────────────────────────
 
-class ColPaliIngester:
+class CLIPIngester:
     """
     Orchestrates the full ingestion pipeline:
       1. PDF → page images  (pdf2image at configurable DPI)
-      2. Page images → ColPali embeddings  (colpali_processor.process_images)
+      2. Page images → CLIP embeddings  (512-dim vectors)
       3. Embeddings + metadata → Qdrant collection
     """
 
@@ -123,7 +252,7 @@ class ColPaliIngester:
         index_name: str,
         qdrant_host: str = QDRANT_HOST,
         qdrant_port: int = QDRANT_PORT,
-        colpali_model: str = COLPALI_MODEL,
+        clip_model: str = CLIP_MODEL,
         dpi: int = 150,
         store_page_images: bool = True,
     ) -> None:
@@ -134,7 +263,7 @@ class ColPaliIngester:
         ----------
         index_name       : logical name for this index (used as Qdrant collection suffix)
         qdrant_host/port : Qdrant connection details
-        colpali_model    : HuggingFace model ID for ColPali
+        clip_model       : HuggingFace model ID for CLIP
         dpi              : rendering resolution for pdf2image (150 balances quality/speed)
         store_page_images: whether to store base64 thumbnails in Qdrant payload
         """
@@ -143,16 +272,21 @@ class ColPaliIngester:
         self.dpi               = dpi
         self.store_page_images = store_page_images
 
-        # Load ColPali model + processor
-        self._model, self._processor = _load_colpali_model(colpali_model)
+        # Load CLIP model + processor
+        self._model, self._processor = _load_clip_model(clip_model)
         self._device = next(self._model.parameters()).device
 
-        # Connect to Qdrant
+        # Connect to Qdrant — fall back to in-memory if server is unreachable
         logger.info(f"Connecting to Qdrant @ {qdrant_host}:{qdrant_port}")
         try:
-            self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
-        except Exception:
-            logger.warning("Remote Qdrant unavailable, falling back to in-memory mode.")
+            self.qdrant = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5)
+            self.qdrant.get_collections()  # test liveness
+            logger.info("Connected to remote Qdrant.")
+        except Exception as exc:
+            logger.warning(
+                f"Remote Qdrant unavailable ({exc}). "
+                "Falling back to in-memory mode (data will not persist across restarts)."
+            )
             self.qdrant = QdrantClient(":memory:")
 
         self._ensure_collection()
@@ -167,7 +301,7 @@ class ColPaliIngester:
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
-                    size=COLPALI_DIM,
+                    size=EMBEDDING_DIM,
                     distance=Distance.COSINE,
                 ),
             )
@@ -178,27 +312,27 @@ class ColPaliIngester:
 
     def _embed_image(self, img: Image.Image) -> np.ndarray:
         """
-        Embed a single PIL image using ColPali.
+        Embed a single PIL image using CLIP's vision encoder.
 
         Steps:
-            1. processor.process_images([img]) → model input batch
-            2. model(**batch) → patch embeddings [1, num_patches, 128]
-            3. mean-pool → [128] vector
+            1. processor(images=[img]) → pixel_values
+            2. model.get_image_features(**inputs) → [1, 512]
+            3. L2-normalise → [512] unit vector
         """
-        batch = self._processor.process_images([img]).to(self._device)
+        inputs = self._processor(images=img, return_tensors="pt").to(self._device)
         with torch.no_grad():
-            embeddings = self._model(**batch)
-        # embeddings[0] shape: [num_patches, 128] → mean-pool → [128]
-        vec = embeddings[0].mean(dim=0).cpu().float().numpy()
-        return vec
+            features = self._model.get_image_features(**inputs)
+        # L2-normalise for cosine similarity
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+        return features[0].cpu().float().numpy()
 
     def _embed_query(self, query: str) -> np.ndarray:
-        """Embed a text query using ColPali's query encoder."""
-        batch = self._processor.process_queries([query]).to(self._device)
+        """Embed a text query using CLIP's text encoder."""
+        inputs = self._processor(text=query, return_tensors="pt", truncation=True).to(self._device)
         with torch.no_grad():
-            embeddings = self._model(**batch)
-        vec = embeddings[0].mean(dim=0).cpu().float().numpy()
-        return vec
+            features = self._model.get_text_features(**inputs)
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+        return features[0].cpu().float().numpy()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -206,7 +340,7 @@ class ColPaliIngester:
         """
         Process a single PDF end-to-end:
           - Convert each page to an image at self.dpi
-          - Embed with ColPali (mean-pooled 128-dim)
+          - Embed with CLIP (512-dim)
           - Upsert into Qdrant with metadata
 
         Parameters

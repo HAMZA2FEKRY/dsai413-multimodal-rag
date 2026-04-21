@@ -3,7 +3,7 @@ src/retrieval.py
 ================
 Retrieval Pipeline
 ------------------
-1. Encodes a user text query with ColPali's query processor.
+1. Encodes a user text query with CLIP's text encoder.
 2. Performs a nearest-neighbour (cosine) search in Qdrant.
 3. Returns the top-K pages with full metadata (doc_name, page_num,
    text_excerpt, page thumbnail).
@@ -32,10 +32,10 @@ from qdrant_client import QdrantClient
 # ──────────────────────────────────────────────────────────────────────────────
 # Defaults (mirror ingestion.py)
 # ──────────────────────────────────────────────────────────────────────────────
-COLPALI_MODEL     = "vidore/colpali-v1.2"
+CLIP_MODEL        = "openai/clip-vit-base-patch32"
 QDRANT_HOST       = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT       = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_PREFIX = "colpali_"
+COLLECTION_PREFIX = "clip_"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,60 +81,51 @@ class RetrievedPage:
 
 class Retriever:
     """
-    Thin wrapper around ColPali query encoding + Qdrant cosine search.
+    Thin wrapper around CLIP query encoding + Qdrant cosine search.
 
     Parameters
     ----------
     index_name     : matches the name used during ingestion
-    colpali_model  : HuggingFace model ID for ColPali
+    clip_model     : HuggingFace model ID for CLIP
     qdrant_host/port : location of your Qdrant instance
     """
 
     def __init__(
         self,
         index_name: str,
-        colpali_model: str  = COLPALI_MODEL,
-        qdrant_host: str    = QDRANT_HOST,
-        qdrant_port: int    = QDRANT_PORT,
+        clip_model: str   = CLIP_MODEL,
+        qdrant_host: str  = QDRANT_HOST,
+        qdrant_port: int  = QDRANT_PORT,
     ) -> None:
-        """Initialise retriever: loads ColPali model and connects to Qdrant."""
+        """Initialise retriever: loads CLIP model and connects to Qdrant."""
         self.collection_name = COLLECTION_PREFIX + index_name
 
-        # Load ColPali model + processor
-        from colpali_engine.models import ColPali, ColPaliProcessor
+        # Load CLIP model + processor
+        from transformers import CLIPModel, CLIPProcessor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Use float16 even on CPU to halve memory (~1.5GB instead of ~3GB)
-        dtype  = torch.bfloat16 if torch.cuda.is_available() else torch.float16
 
-        logger.info(f"Loading ColPali retrieval model: {colpali_model} on {device}")
-        self._model = ColPali.from_pretrained(
-            colpali_model,
-            torch_dtype=dtype,
-            device_map=device,
-            low_cpu_mem_usage=True,
-        ).eval()
-        self._processor = ColPaliProcessor.from_pretrained(colpali_model)
+        logger.info(f"Loading CLIP retrieval model: {clip_model} on {device}")
+        self._model = CLIPModel.from_pretrained(clip_model).to(device).eval()
+        self._processor = CLIPProcessor.from_pretrained(clip_model)
         self._device = next(self._model.parameters()).device
 
-        # Connect to Qdrant
+        # Connect to Qdrant — fall back to in-memory if server unreachable
         logger.info(f"Connecting to Qdrant @ {qdrant_host}:{qdrant_port}")
         try:
-            self._qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
-        except Exception:
-            logger.warning("Remote Qdrant unavailable, falling back to in-memory mode.")
+            self._qdrant = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=5)
+            self._qdrant.get_collections()  # test liveness
+        except Exception as exc:
+            logger.warning(f"Remote Qdrant unavailable ({exc}), using in-memory mode.")
             self._qdrant = QdrantClient(":memory:")
 
     # ── Query encoding ────────────────────────────────────────────────────────
 
     def _encode_query(self, query: str) -> np.ndarray:
         """
-        Encode a text query with ColPali's query processor.
+        Encode a text query with CLIP's text encoder.
 
         Steps:
-            1. processor.process_queries([query]) → model input batch
-            2. model(**batch) → token embeddings [1, num_tokens, 128]
-            3. mean-pool → [128] vector
 
         Returns
         -------

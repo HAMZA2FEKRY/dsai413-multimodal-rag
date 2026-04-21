@@ -2,7 +2,8 @@
 colpali-engine>=0.3.1               # ColPali model + processor
 torch>=2.2.0
 torchvision>=0.17.0
-transformers>=4.40.0
+transformers>=4.45.0,<5.0.0         # 5.x broke ColPali key_mapping API
+tokenizers>=0.21.0,<0.22.0          # must match transformers 4.47.x requirement
 Pillow>=10.3.0
 
 # ── PDF Processing ──────────────────────────────────────────────────────────
