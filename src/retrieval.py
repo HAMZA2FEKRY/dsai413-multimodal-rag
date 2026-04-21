@@ -102,12 +102,27 @@ class Retriever:
 
         # Load CLIP model + processor
         from transformers import CLIPModel, CLIPProcessor
+        from pathlib import Path
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        logger.info(f"Loading CLIP retrieval model: {clip_model} on {device}")
-        self._model = CLIPModel.from_pretrained(clip_model).to(device).eval()
-        self._processor = CLIPProcessor.from_pretrained(clip_model)
+        # Try local cache first (avoids httpx version conflicts)
+        _local_cache = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{clip_model.replace('/', '--')}"
+        if _local_cache.exists():
+            snapshots = _local_cache / "snapshots"
+            local_dirs = sorted(snapshots.iterdir()) if snapshots.exists() else []
+            if local_dirs:
+                model_path = str(local_dirs[-1])
+                logger.info(f"Loading CLIP retrieval model from local cache: {model_path}")
+            else:
+                model_path = clip_model
+                logger.info(f"Loading CLIP retrieval model: {clip_model} on {device}")
+        else:
+            model_path = clip_model
+            logger.info(f"Loading CLIP retrieval model: {clip_model} on {device}")
+
+        self._model = CLIPModel.from_pretrained(model_path).to(device).eval()
+        self._processor = CLIPProcessor.from_pretrained(model_path)
         self._device = next(self._model.parameters()).device
 
         # Connect to Qdrant (shared singleton — important for in-memory mode)
@@ -120,16 +135,15 @@ class Retriever:
         """
         Encode a text query with CLIP's text encoder.
 
-        Steps:
-
         Returns
         -------
-        np.ndarray of shape [128].
+        np.ndarray of shape [512].
         """
-        batch = self._processor.process_queries([query]).to(self._device)
+        inputs = self._processor(text=query, return_tensors="pt", truncation=True).to(self._device)
         with torch.no_grad():
-            embeddings = self._model(**batch)
-        return embeddings[0].mean(dim=0).cpu().float().numpy()
+            features = self._model.get_text_features(**inputs)
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+        return features[0].cpu().float().numpy()
 
     # ── Qdrant search ─────────────────────────────────────────────────────────
 
@@ -161,13 +175,15 @@ class Retriever:
             return []
 
         try:
-            hits = self._qdrant.search(
+            from qdrant_client.models import models
+            response = self._qdrant.query_points(
                 collection_name=self.collection_name,
-                query_vector=vec.tolist(),
+                query=vec.tolist(),
                 limit=top_k,
                 score_threshold=score_threshold,
                 with_payload=True,
             )
+            hits = response.points
         except Exception as exc:
             logger.error(f"Qdrant search failed: {exc}")
             return []
